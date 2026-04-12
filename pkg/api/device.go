@@ -32,16 +32,6 @@ func (c *Client) GetDevices() ([]Device, error) {
 		return nil, fmt.Errorf("failed to parse devices: %w", err)
 	}
 
-	for i, d := range devices {
-		if d.Type == "switch" {
-			switchPorts, err := c.GetPorts(d.Mac)
-			if err != nil {
-				return nil, fmt.Errorf("failed to get ports: %s", err)
-			}
-			devices[i].Ports = switchPorts
-		}
-	}
-
 	return devices, nil
 }
 

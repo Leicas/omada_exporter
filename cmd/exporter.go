@@ -93,12 +93,7 @@ func run(c *cli.Context) error {
 		return err
 	}
 
-	// register omada collectors on the default registry
-	for _, c := range collectors(client) {
-		prometheus.MustRegister(c)
-	}
-
-	// create per-collector registries for dedicated endpoints
+	// create collectors once, register on both default and per-collector registries
 	collectorMap := map[string]prometheus.Collector{
 		"client":     collector.NewClientCollector(client),
 		"controller": collector.NewControllerCollector(client),
@@ -107,6 +102,7 @@ func run(c *cli.Context) error {
 		"site":       collector.NewSiteCollector(client),
 	}
 	for name, c := range collectorMap {
+		prometheus.MustRegister(c)
 		reg := prometheus.NewRegistry()
 		reg.MustRegister(c)
 		http.Handle(fmt.Sprintf("/metrics/%s", name), promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))

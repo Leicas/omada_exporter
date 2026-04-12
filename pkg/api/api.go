@@ -110,29 +110,28 @@ func Configure(c *config.Config) (*Client, error) {
 }
 
 func (c *Client) makeRequest(req *http.Request) (*http.Response, error) {
-	req.Header.Add("Accept", "application/json")
-	req.Header.Add("X-Requested-With", "XMLHttpRequest")
-	req.Header.Add("User-Agent", "omada_exporter")
-	req.Header.Add("Connection", "keep-alive")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	req.Header.Set("User-Agent", "omada_exporter")
+	req.Header.Set("Connection", "keep-alive")
+	req.Header.Set("Omada-Request-Source", "web-local")
 
 	if c.token != "" {
-		req.Header.Add("Csrf-Token", c.token)
+		req.Header.Set("Csrf-Token", c.token)
 	}
 
 	return c.httpClient.Do(req)
 }
 
+// makeLoggedInRequest ensures we are logged in before making the request.
+// Instead of pre-checking login status on every call, it logs in once on first
+// use and only re-authenticates when a request returns an auth error.
 func (c *Client) makeLoggedInRequest(req *http.Request) (*http.Response, error) {
-	loggedIn, err := c.IsLoggedIn()
-	if err != nil {
-		return nil, err
-	}
-	if !loggedIn {
+	// Login once if we don't have a token yet
+	if c.token == "" {
 		log.Info().Msg(fmt.Sprintf("not logged in, logging in with user: %s", c.Config.Username))
-		err := c.Login()
-		if err != nil || c.token == "" {
-			log.Error().Err(err).Msg("failed to login")
-			return nil, err
+		if err := c.Login(); err != nil {
+			return nil, fmt.Errorf("login failed: %w", err)
 		}
 	}
 
