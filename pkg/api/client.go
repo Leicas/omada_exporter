@@ -35,26 +35,49 @@ func (c *Client) GetClients() ([]NetworkClient, error) {
 }
 
 // getClientsWithFilters fetches active clients. It tries the standard clients
-// endpoint first, and falls back to the insight/clients endpoint for Omada
-// controller v6.x where the standard endpoint may not be available for Viewer roles.
+// endpoint first, and falls back to a split strategy for Omada v6.x where the
+// Viewer role can only query wireless clients via the standard endpoint.
 func (c *Client) getClientsWithFilters(filtersEnabled bool, mac string) ([]NetworkClient, error) {
-	clients, err := c.getClientsStandard(filtersEnabled, mac)
+	// Try the standard endpoint with no wireless filter (works on older controllers)
+	clients, err := c.getClientsStandard(filtersEnabled, mac, "")
 	if err == nil {
 		return clients, nil
 	}
-	log.Debug().Err(err).Msg("Standard clients endpoint failed, trying insight endpoint")
+	log.Debug().Err(err).Msg("Standard clients endpoint failed, trying wireless+wired split")
 
-	// Fallback: use insight/clients endpoint (works on v6.x with Viewer role)
-	clients, insightErr := c.getClientsFromInsight()
-	if insightErr != nil {
-		// Return the original error as it's more informative
-		return nil, fmt.Errorf("clients endpoint failed: %w (insight fallback also failed: %v)", err, insightErr)
+	// v6.x Viewer role workaround: wireless filter works, wired doesn't.
+	// Fetch wireless clients via standard endpoint (full signal/RSSI/rate data),
+	// then fetch wired clients from the insight fallback.
+	var allClients []NetworkClient
+
+	wireless, wirelessErr := c.getClientsStandard(filtersEnabled, mac, "true")
+	if wirelessErr != nil {
+		log.Debug().Err(wirelessErr).Msg("Wireless clients endpoint also failed, falling back to insight for all")
+		// Full fallback to insight for everything
+		allClients, err = c.getClientsFromInsight()
+		if err != nil {
+			return nil, fmt.Errorf("all client endpoints failed: standard (%v), insight (%v)", wirelessErr, err)
+		}
+	} else {
+		allClients = append(allClients, wireless...)
+		log.Info().Int("wireless", len(wireless)).Msg("Fetched wireless clients via standard endpoint")
 	}
 
-	// If using insight with switchMac filter, filter client-side
+	// Fetch wired clients from insight fallback
+	wired, wiredErr := c.getWiredClientsFromInsight()
+	if wiredErr != nil {
+		log.Debug().Err(wiredErr).Msg("Failed to get wired clients from insight")
+	} else if wirelessErr == nil {
+		// Only add wired if we got wireless from the standard endpoint
+		// (otherwise getClientsFromInsight above already included both)
+		allClients = append(allClients, wired...)
+		log.Info().Int("wired", len(wired)).Msg("Fetched wired clients via insight fallback")
+	}
+
+	// If using switchMac filter, filter client-side
 	if filtersEnabled && mac != "" {
 		var filtered []NetworkClient
-		for _, cl := range clients {
+		for _, cl := range allClients {
 			if cl.SwitchMac == mac {
 				filtered = append(filtered, cl)
 			}
@@ -62,10 +85,10 @@ func (c *Client) getClientsWithFilters(filtersEnabled bool, mac string) ([]Netwo
 		return filtered, nil
 	}
 
-	return clients, nil
+	return allClients, nil
 }
 
-func (c *Client) getClientsStandard(filtersEnabled bool, mac string) ([]NetworkClient, error) {
+func (c *Client) getClientsStandard(filtersEnabled bool, mac string, wirelessFilter string) ([]NetworkClient, error) {
 	url := fmt.Sprintf("%s/%s/api/v2/sites/%s/clients", c.Config.Host, c.omadaCID, c.SiteId)
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
@@ -76,6 +99,9 @@ func (c *Client) getClientsStandard(filtersEnabled bool, mac string) ([]NetworkC
 	q.Add("currentPage", "1")
 	q.Add("currentPageSize", "10000")
 	q.Add("filters.active", "true")
+	if wirelessFilter != "" {
+		q.Add("filters.wireless", wirelessFilter)
+	}
 	if filtersEnabled {
 		q.Add("filters.switchMac", mac)
 	}
@@ -170,10 +196,26 @@ func (c *Client) getClientsFromInsight() ([]NetworkClient, error) {
 	}
 
 	log.Info().Int("active", len(clients)).Int("total", len(paginated.Data)).
-		Msg("Using insight/clients fallback (some wireless metrics unavailable)")
+		Msg("Using insight/clients fallback (some metrics unavailable)")
 
 	return clients, nil
 }
+
+// getWiredClientsFromInsight fetches only wired clients from the insight endpoint.
+func (c *Client) getWiredClientsFromInsight() ([]NetworkClient, error) {
+	allClients, err := c.getClientsFromInsight()
+	if err != nil {
+		return nil, err
+	}
+	var wired []NetworkClient
+	for _, cl := range allClients {
+		if !cl.Wireless {
+			wired = append(wired, cl)
+		}
+	}
+	return wired, nil
+}
+
 type NetworkClient struct {
 	Name        string  `json:"name"`
 	HostName    string  `json:"hostName"`
