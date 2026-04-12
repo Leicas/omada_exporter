@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -34,50 +35,33 @@ func (c *Client) GetClients() ([]NetworkClient, error) {
 	return client, nil
 }
 
-// getClientsWithFilters fetches active clients. It tries the standard clients
-// endpoint first, and falls back to a split strategy for Omada v6.x where the
-// Viewer role can only query wireless clients via the standard endpoint.
+// getClientsWithFilters fetches active clients. It tries the OpenAPI v2 endpoint
+// first (POST with JSON body, used by the web UI), then falls back to the legacy
+// api/v2 GET endpoint, and finally to the insight endpoint.
 func (c *Client) getClientsWithFilters(filtersEnabled bool, mac string) ([]NetworkClient, error) {
-	// Try the standard endpoint with no wireless filter (works on older controllers)
-	clients, err := c.getClientsStandard(filtersEnabled, mac, "")
+	// Try OpenAPI v2 endpoint (works for all clients on v6.x, same as web UI)
+	clients, err := c.getClientsOpenAPI(filtersEnabled, mac)
 	if err == nil {
 		return clients, nil
 	}
-	log.Debug().Err(err).Msg("Standard clients endpoint failed, trying wireless+wired split")
+	log.Debug().Err(err).Msg("OpenAPI clients endpoint failed, trying legacy endpoint")
 
-	// v6.x Viewer role workaround: wireless filter works, wired doesn't.
-	// Fetch wireless clients via standard endpoint (full signal/RSSI/rate data),
-	// then fetch wired clients from the insight fallback.
-	var allClients []NetworkClient
+	// Fallback: try legacy api/v2 GET endpoint (works on older controllers)
+	clients, err = c.getClientsLegacy(filtersEnabled, mac)
+	if err == nil {
+		return clients, nil
+	}
+	log.Debug().Err(err).Msg("Legacy clients endpoint failed, trying insight fallback")
 
-	wireless, wirelessErr := c.getClientsStandard(filtersEnabled, mac, "true")
-	if wirelessErr != nil {
-		log.Debug().Err(wirelessErr).Msg("Wireless clients endpoint also failed, falling back to insight for all")
-		// Full fallback to insight for everything
-		allClients, err = c.getClientsFromInsight()
-		if err != nil {
-			return nil, fmt.Errorf("all client endpoints failed: standard (%v), insight (%v)", wirelessErr, err)
-		}
-	} else {
-		allClients = append(allClients, wireless...)
-		log.Info().Int("wireless", len(wireless)).Msg("Fetched wireless clients via standard endpoint")
+	// Final fallback: insight endpoint (limited data but always works)
+	clients, insightErr := c.getClientsFromInsight()
+	if insightErr != nil {
+		return nil, fmt.Errorf("all client endpoints failed: openapi, legacy, insight (%v)", insightErr)
 	}
 
-	// Fetch wired clients from insight fallback
-	wired, wiredErr := c.getWiredClientsFromInsight()
-	if wiredErr != nil {
-		log.Debug().Err(wiredErr).Msg("Failed to get wired clients from insight")
-	} else if wirelessErr == nil {
-		// Only add wired if we got wireless from the standard endpoint
-		// (otherwise getClientsFromInsight above already included both)
-		allClients = append(allClients, wired...)
-		log.Info().Int("wired", len(wired)).Msg("Fetched wired clients via insight fallback")
-	}
-
-	// If using switchMac filter, filter client-side
 	if filtersEnabled && mac != "" {
 		var filtered []NetworkClient
-		for _, cl := range allClients {
+		for _, cl := range clients {
 			if cl.SwitchMac == mac {
 				filtered = append(filtered, cl)
 			}
@@ -85,10 +69,63 @@ func (c *Client) getClientsWithFilters(filtersEnabled bool, mac string) ([]Netwo
 		return filtered, nil
 	}
 
-	return allClients, nil
+	return clients, nil
 }
 
-func (c *Client) getClientsStandard(filtersEnabled bool, mac string, wirelessFilter string) ([]NetworkClient, error) {
+// getClientsOpenAPI fetches clients via the OpenAPI v2 POST endpoint.
+// This is the same endpoint the Omada web UI uses and returns full data
+// for both wired and wireless clients, even with Viewer role on v6.x.
+func (c *Client) getClientsOpenAPI(filtersEnabled bool, mac string) ([]NetworkClient, error) {
+	url := fmt.Sprintf("%s/openapi/v2/%s/sites/%s/clients", c.Config.Host, c.omadaCID, c.SiteId)
+
+	filters := map[string]interface{}{"active": true}
+	if filtersEnabled && mac != "" {
+		filters["switchMac"] = mac
+	}
+
+	reqBody := map[string]interface{}{
+		"filters":  filters,
+		"page":     1,
+		"pageSize": 1000,
+		"scope":    1,
+	}
+
+	jsonBody, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest("POST", url, bytes.NewReader(jsonBody))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json;charset=utf-8")
+	req.Header.Set("Omada-Request-Source", "web-local")
+
+	resp, err := c.makeLoggedInRequest(req)
+	if err != nil {
+		return nil, err
+	}
+
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	log.Debug().Bytes("data", body).Msg("Received data from OpenAPI clients endpoint")
+
+	clients, err := parseListResult[NetworkClient](body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse OpenAPI clients: %w", err)
+	}
+
+	log.Info().Int("clients", len(clients)).Msg("Fetched clients via OpenAPI v2 endpoint")
+	return clients, nil
+}
+
+// getClientsLegacy fetches clients via the legacy api/v2 GET endpoint.
+// This works on older Omada controllers but may fail on v6.x for Viewer role.
+func (c *Client) getClientsLegacy(filtersEnabled bool, mac string) ([]NetworkClient, error) {
 	url := fmt.Sprintf("%s/%s/api/v2/sites/%s/clients", c.Config.Host, c.omadaCID, c.SiteId)
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
@@ -99,9 +136,6 @@ func (c *Client) getClientsStandard(filtersEnabled bool, mac string, wirelessFil
 	q.Add("currentPage", "1")
 	q.Add("currentPageSize", "10000")
 	q.Add("filters.active", "true")
-	if wirelessFilter != "" {
-		q.Add("filters.wireless", wirelessFilter)
-	}
 	if filtersEnabled {
 		q.Add("filters.switchMac", mac)
 	}
@@ -118,11 +152,11 @@ func (c *Client) getClientsStandard(filtersEnabled bool, mac string, wirelessFil
 	if err != nil {
 		return nil, err
 	}
-	log.Debug().Bytes("data", body).Msg("Received data from clients endpoint")
+	log.Debug().Bytes("data", body).Msg("Received data from legacy clients endpoint")
 
 	clients, err := parseListResult[NetworkClient](body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse clients: %w", err)
+		return nil, fmt.Errorf("failed to parse legacy clients: %w", err)
 	}
 
 	return clients, nil
