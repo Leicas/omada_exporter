@@ -93,9 +93,23 @@ func run(c *cli.Context) error {
 		return err
 	}
 
-	// register omada collectors
+	// register omada collectors on the default registry
 	for _, c := range collectors(client) {
 		prometheus.MustRegister(c)
+	}
+
+	// create per-collector registries for dedicated endpoints
+	collectorMap := map[string]prometheus.Collector{
+		"client":     collector.NewClientCollector(client),
+		"controller": collector.NewControllerCollector(client),
+		"device":     collector.NewDeviceCollector(client),
+		"port":       collector.NewPortCollector(client),
+		"site":       collector.NewSiteCollector(client),
+	}
+	for name, c := range collectorMap {
+		reg := prometheus.NewRegistry()
+		reg.MustRegister(c)
+		http.Handle(fmt.Sprintf("/metrics/%s", name), promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
 	}
 
 	log.Info().Msg(fmt.Sprintf("listening on :%s", conf.Port))
@@ -107,7 +121,12 @@ func run(c *cli.Context) error {
     	<body>
 			<h1>omada_exporter</h1>
 			<p>
-				<a href="/metrics">Metrics</a>
+				<a href="/metrics">All Metrics</a><br>
+				<a href="/metrics/client">Client Metrics</a><br>
+				<a href="/metrics/controller">Controller Metrics</a><br>
+				<a href="/metrics/device">Device Metrics</a><br>
+				<a href="/metrics/port">Port Metrics</a><br>
+				<a href="/metrics/site">Site Metrics</a>
 			</p>
     	</body>
     </html>`))
@@ -160,5 +179,6 @@ func collectors(client *api.Client) []prometheus.Collector {
 		collector.NewControllerCollector(client),
 		collector.NewDeviceCollector(client),
 		collector.NewPortCollector(client),
+		collector.NewSiteCollector(client),
 	}
 }
