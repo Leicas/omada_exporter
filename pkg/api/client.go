@@ -201,19 +201,75 @@ func (c *Client) getClientsFromInsight() ([]NetworkClient, error) {
 	return clients, nil
 }
 
-// getWiredClientsFromInsight fetches only wired clients from the insight endpoint.
+// getWiredClientsDetailed fetches wired client MACs from insight, then gets
+// full details for each via /clients/{mac} (which works for Viewer role on v6.x).
 func (c *Client) getWiredClientsFromInsight() ([]NetworkClient, error) {
-	allClients, err := c.getClientsFromInsight()
+	insightClients, err := c.getClientsFromInsight()
 	if err != nil {
 		return nil, err
 	}
-	var wired []NetworkClient
-	for _, cl := range allClients {
+
+	var wiredMacs []string
+	for _, cl := range insightClients {
 		if !cl.Wireless {
-			wired = append(wired, cl)
+			wiredMacs = append(wiredMacs, cl.Mac)
 		}
 	}
+
+	if len(wiredMacs) == 0 {
+		return nil, nil
+	}
+
+	// Fetch full details for each wired client via /clients/{mac}
+	var wired []NetworkClient
+	for _, mac := range wiredMacs {
+		client, err := c.getClientByMac(mac)
+		if err != nil {
+			log.Debug().Err(err).Str("mac", mac).Msg("Failed to fetch wired client detail")
+			continue
+		}
+		if client != nil {
+			wired = append(wired, *client)
+		}
+	}
+
+	log.Info().Int("wired", len(wired)).Int("macs", len(wiredMacs)).
+		Msg("Fetched wired client details via per-client endpoint")
+
 	return wired, nil
+}
+
+// getClientByMac fetches full details for a single client by MAC address.
+// This endpoint works for Viewer role on v6.x even when the list endpoint doesn't.
+func (c *Client) getClientByMac(mac string) (*NetworkClient, error) {
+	url := fmt.Sprintf("%s/%s/api/v2/sites/%s/clients/%s", c.Config.Host, c.omadaCID, c.SiteId, mac)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.makeLoggedInRequest(req)
+	if err != nil {
+		return nil, err
+	}
+
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	raw, err := checkResponse(body)
+	if err != nil {
+		return nil, err
+	}
+
+	var client NetworkClient
+	if err := json.Unmarshal(raw, &client); err != nil {
+		return nil, fmt.Errorf("failed to parse client %s: %w", mac, err)
+	}
+
+	return &client, nil
 }
 
 type NetworkClient struct {
