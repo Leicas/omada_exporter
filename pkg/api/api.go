@@ -1,9 +1,11 @@
 package api
 
 import (
+	"bytes"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/cookiejar"
 	"time"
@@ -126,8 +128,26 @@ func (c *Client) makeRequest(req *http.Request) (*http.Response, error) {
 // makeLoggedInRequest ensures we are logged in before making the request.
 // Instead of pre-checking login status on every call, it logs in once on first
 // use and only re-authenticates when a request returns an auth error.
+//
+// Omada session cookies and CSRF tokens expire after a period of inactivity.
+// When that happens the controller answers with HTTP 200 but an auth errorCode
+// in the JSON body, so we inspect the payload (not the status code), re-login
+// once, and replay the request. Without this the exporter would keep sending an
+// expired token forever and silently stop producing metrics until restarted.
 func (c *Client) makeLoggedInRequest(req *http.Request) (*http.Response, error) {
-	// Login once if we don't have a token yet
+	// Buffer the request body up front so the request can be replayed after a
+	// re-login (http.Request bodies are single-use once sent).
+	var bodyBytes []byte
+	if req.Body != nil {
+		var err error
+		bodyBytes, err = io.ReadAll(req.Body)
+		req.Body.Close()
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Login once if we don't have a token yet.
 	if c.token == "" {
 		log.Info().Msg(fmt.Sprintf("not logged in, logging in with user: %s", c.Config.Username))
 		if err := c.Login(); err != nil {
@@ -135,5 +155,53 @@ func (c *Client) makeLoggedInRequest(req *http.Request) (*http.Response, error) 
 		}
 	}
 
-	return c.makeRequest(req)
+	resp, body, authErr, err := c.doDetectingAuth(req, bodyBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	// Session expired or token rejected: re-authenticate once and replay.
+	if authErr {
+		log.Info().Msg("session expired or token rejected, re-authenticating")
+		if err := c.Login(); err != nil {
+			return nil, fmt.Errorf("re-login failed: %w", err)
+		}
+		resp, body, _, err = c.doDetectingAuth(req, bodyBytes)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Restore the consumed body so callers can read the response normally.
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	return resp, nil
+}
+
+// doDetectingAuth sends req (restoring its body from bodyBytes first), reads the
+// full response body, and reports whether the controller returned an auth error
+// code. The response body is consumed and returned separately so the caller can
+// decide whether to retry before handing it back.
+func (c *Client) doDetectingAuth(req *http.Request, bodyBytes []byte) (*http.Response, []byte, bool, error) {
+	if bodyBytes != nil {
+		req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		req.ContentLength = int64(len(bodyBytes))
+	}
+
+	resp, err := c.makeRequest(req)
+	if err != nil {
+		return nil, nil, false, err
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		return nil, nil, false, err
+	}
+
+	var probe struct {
+		ErrorCode int `json:"errorCode"`
+	}
+	authErr := json.Unmarshal(body, &probe) == nil && isAuthError(probe.ErrorCode)
+
+	return resp, body, authErr, nil
 }
