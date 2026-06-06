@@ -3,8 +3,10 @@ version: 2
 env:
   - GO111MODULE=on
 
-gomod:
-  proxy: true
+# NOTE: gomod.proxy is intentionally disabled. This is a fork whose go.mod
+# module path is still github.com/charlie-haley/omada_exporter, so proxying
+# would try to fetch the tag from upstream (which doesn't have it) and fail
+# with "unknown revision". Build from the local checkout instead.
 
 builds:
   - env:
