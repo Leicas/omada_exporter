@@ -34,7 +34,7 @@ dockers:
       - "ghcr.io/leicas/omada_exporter:{{ .Major }}.{{ .Minor }}-amd64"
       - "ghcr.io/leicas/omada_exporter:{{ .Major }}-amd64"
     use: buildx
-    dockerfile: Dockerfile
+    dockerfile: Dockerfile.goreleaser
     goarch: amd64
     build_flag_templates:
       - "--pull"
@@ -53,7 +53,7 @@ dockers:
       - "ghcr.io/leicas/omada_exporter:{{ .Major }}.{{ .Minor }}-arm64v8"
       - "ghcr.io/leicas/omada_exporter:{{ .Major }}-arm64v8"
     use: buildx
-    dockerfile: Dockerfile
+    dockerfile: Dockerfile.goreleaser
     goarch: arm64
     build_flag_templates:
     - "--pull"
